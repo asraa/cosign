@@ -28,14 +28,12 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/cyberphone/json-canonicalization/go/src/webpki.org/jsoncanonicalizer"
 	"github.com/go-openapi/swag"
 	"github.com/secure-systems-lab/go-securesystemslib/dsse"
-	"github.com/sigstore/cosign/cmd/cosign/cli/options"
 	"github.com/sigstore/cosign/internal/pkg/cosign/rekor/mock"
 	"github.com/sigstore/cosign/pkg/cosign"
 	"github.com/sigstore/cosign/pkg/cosign/bundle"
@@ -249,6 +247,26 @@ func TestVerifyBlob(t *testing.T) {
 			shouldErr:    false,
 		},
 		{
+			name:         "valid signature with public key - good bundle provided",
+			blob:         blobBytes,
+			signature:    blobSignature,
+			sigVerifier:  signer,
+			experimental: false,
+			bundlePath: makeLocalBundle(t, *rekorSigner, blobBytes, []byte(blobSignature),
+				unexpiredLeafCert, true),
+			shouldErr: false,
+		},
+		{
+			name:         "valid signature with public key - bad bundle SET",
+			blob:         blobBytes,
+			signature:    blobSignature,
+			sigVerifier:  signer,
+			experimental: false,
+			bundlePath: makeLocalBundle(t, *signer, blobBytes, []byte(blobSignature),
+				unexpiredLeafCert, true),
+			shouldErr: true,
+		},
+		{
 			name:         "invalid signature with public key",
 			blob:         blobBytes,
 			signature:    makeSignature([]byte("bar")),
@@ -369,6 +387,17 @@ func TestVerifyBlob(t *testing.T) {
 			experimental: false,
 			bundlePath: makeLocalBundle(t, *rekorSigner, blobBytes, []byte(blobSignature),
 				expiredLeafCert, false),
+			shouldErr: true,
+		},
+		{
+			name:         "valid signature with expired certificate - bundle with bad SET",
+			blob:         blobBytes,
+			signature:    blobSignature,
+			sigVerifier:  signer,
+			cert:         expiredLeafCert,
+			experimental: false,
+			bundlePath: makeLocalBundle(t, *signer, blobBytes, []byte(blobSignature),
+				expiredLeafCert, true),
 			shouldErr: true,
 		},
 		{
@@ -521,169 +550,6 @@ func makeLocalBundle(t *testing.T, rekorSigner signature.ECDSASignerVerifier,
 		t.Fatal(err)
 	}
 	return bundlePath
-}
-
-func TestVerifyBlobCmdWithBundle(t *testing.T) {
-	td := t.TempDir()
-
-	// Note that COSIGN_EXPERIMENTAL=1 is not needed for offline bundles.
-
-	identity := "hello@foo.com"
-	issuer := "issuer"
-
-	// Generate certificate chain
-	rootCert, rootPriv, _ := test.GenerateRootCa()
-	rootPemCert, _ := cryptoutils.MarshalCertificateToPEM(rootCert)
-	subCert, subPriv, _ := test.GenerateSubordinateCa(rootCert, rootPriv)
-	subPemCert, _ := cryptoutils.MarshalCertificateToPEM(subCert)
-	leafCert, leafPriv, _ := test.GenerateLeafCert(identity, issuer, subCert, subPriv)
-	leafPemCert, _ := cryptoutils.MarshalCertificateToPEM(leafCert)
-
-	// Write certificate chain to disk
-	var chain []byte
-	chain = append(chain, subPemCert...)
-	chain = append(chain, rootPemCert...)
-	tmpChainFile, err := os.CreateTemp(td, "cosign_fulcio_chain_*.cert")
-	if err != nil {
-		t.Fatalf("failed to create temp chain file: %v", err)
-	}
-	defer tmpChainFile.Close()
-	if _, err := tmpChainFile.Write(chain); err != nil {
-		t.Fatalf("failed to write chain file: %v", err)
-	}
-	// Override for Fulcio root so it doesn't use TUF
-	t.Setenv("SIGSTORE_ROOT_FILE", tmpChainFile.Name())
-
-	// Create blob and write to disk
-	blob := "someblob"
-	blobPath := filepath.Join(td, blob)
-	if err := os.WriteFile(blobPath, []byte(blob), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	// Sign blob with private key
-	signer, err := signature.LoadECDSASignerVerifier(leafPriv, crypto.SHA256)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sig, err := signer.SignMessage(bytes.NewReader([]byte(blob)))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Create Rekor private key to sign bundle and write to disk
-	rekorPriv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	rekorSigner, err := signature.LoadECDSASignerVerifier(rekorPriv, crypto.SHA256)
-	if err != nil {
-		t.Fatal(err)
-	}
-	pemRekor, err := cryptoutils.MarshalPublicKeyToPEM(rekorSigner.Public())
-	if err != nil {
-		t.Fatal(err)
-	}
-	tmpRekorPubFile, err := os.CreateTemp(td, "cosign_rekor_pub_*.key")
-	if err != nil {
-		t.Fatalf("failed to create temp rekor pub file: %v", err)
-	}
-	defer tmpRekorPubFile.Close()
-	if _, err := tmpRekorPubFile.Write(pemRekor); err != nil {
-		t.Fatalf("failed to write rekor pub file: %v", err)
-	}
-	// Override for Rekor public key so it doesn't use TUF
-	t.Setenv("SIGSTORE_REKOR_PUBLIC_KEY", tmpRekorPubFile.Name())
-
-	// Calculate log ID, the digest of the Rekor public key
-	logID, err := getLogID(rekorSigner.Public())
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Create bundle with:
-	// * Blob signature
-	// * Signing certificate
-	// * Bundle with a payload and signature over the payload
-	b := cosign.LocalSignedPayload{
-		Base64Signature: base64.StdEncoding.EncodeToString(sig),
-		Cert:            string(leafPemCert),
-		Bundle: &bundle.RekorBundle{
-			SignedEntryTimestamp: []byte{},
-			Payload: bundle.RekorPayload{
-				LogID:          logID,
-				IntegratedTime: leafCert.NotBefore.Unix() + 1,
-				LogIndex:       1,
-				// Body is unused, certificate is fetched from b.Cert
-				Body: ""},
-		},
-	}
-
-	// Marshal payload, sign, and set SET in Bundle
-	jsonPayload, err := json.Marshal(b.Bundle.Payload)
-	if err != nil {
-		t.Fatal(err)
-	}
-	canonicalized, err := jsoncanonicalizer.Transform(jsonPayload)
-	if err != nil {
-		t.Fatal(err)
-	}
-	bundleSig, err := rekorSigner.SignMessage(bytes.NewReader(canonicalized))
-	if err != nil {
-		t.Fatal(err)
-	}
-	b.Bundle.SignedEntryTimestamp = bundleSig
-
-	// Write bundle to disk
-	jsonBundle, err := json.Marshal(b)
-	if err != nil {
-		t.Fatal(err)
-	}
-	bundlePath := filepath.Join(td, "bundle.sig")
-	if err := os.WriteFile(bundlePath, jsonBundle, 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	// Verify with identity flags
-	err = VerifyBlobCmd(context.Background(),
-		options.KeyOpts{BundlePath: bundlePath},
-		"",       /*certRef*/ // Cert is fetched from bundle
-		identity, /*certEmail*/
-		issuer,   /*certOidcIssuer*/
-		"",       /*certChain*/ // Chain is fetched from TUF/SIGSTORE_ROOT_FILE
-		"",       /*sigRef*/    // Sig is fetched from bundle
-		blobPath, /*blobRef*/
-		// GitHub identity flags start
-		"", "", "", "", "",
-		// GitHub identity flags end
-		false /*enforceSCT*/)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Failure: Invalid signature on blob results in error
-	b.Bundle.SignedEntryTimestamp = []byte{}
-	jsonBundle, err = json.Marshal(b)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(bundlePath, jsonBundle, 0644); err != nil {
-		t.Fatal(err)
-	}
-	err = VerifyBlobCmd(context.Background(),
-		options.KeyOpts{BundlePath: bundlePath},
-		"",       /*certRef*/ // Cert is fetched from bundle
-		identity, /*certEmail*/
-		issuer,   /*certOidcIssuer*/
-		"",       /*certChain*/ // Chain is fetched from TUF/SIGSTORE_ROOT_FILE
-		"",       /*sigRef*/    // Sig is fetched from bundle
-		blobPath, /*blobRef*/
-		// GitHub identity flags start
-		"", "", "", "", "",
-		// GitHub identity flags end
-		false /*enforceSCT*/)
-	if err == nil || !strings.Contains(err.Error(), "unable to verify SET") {
-		t.Fatalf("expected error verifying SET, got %v", err)
-	}
 }
 
 // getLogID calculates the digest of a PKIX-encoded public key
