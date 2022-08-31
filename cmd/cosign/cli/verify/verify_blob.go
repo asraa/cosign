@@ -50,7 +50,6 @@ import (
 	hashedrekord "github.com/sigstore/rekor/pkg/types/hashedrekord/v0.0.1"
 	rekord "github.com/sigstore/rekor/pkg/types/rekord/v0.0.1"
 	"github.com/sigstore/sigstore/pkg/cryptoutils"
-	"github.com/sigstore/sigstore/pkg/signature"
 	"github.com/sigstore/sigstore/pkg/signature/dsse"
 )
 
@@ -65,7 +64,6 @@ func VerifyBlobCmd(ctx context.Context, ko options.KeyOpts, certRef, certEmail,
 	certGithubWorkflowName,
 	certGithubWorkflowRepository,
 	certGithubWorkflowRef string, enforceSCT bool) error {
-	var verifier signature.Verifier
 	var cert *x509.Certificate
 
 	if !options.OneOf(ko.KeyRef, ko.Sk, certRef) && !options.EnableExperimental() && ko.BundlePath == "" {
@@ -93,13 +91,15 @@ func VerifyBlobCmd(ctx context.Context, ko options.KeyOpts, certRef, certEmail,
 		EnforceSCT:                   enforceSCT,
 	}
 	if options.EnableExperimental() {
-		if ko.RekorURL != "" {
+		if ko.RekorURL != "" && options.EnableExperimental() {
 			rekorClient, err := rekor.NewClient(ko.RekorURL)
 			if err != nil {
 				return fmt.Errorf("creating Rekor client: %w", err)
 			}
 			co.RekorClient = rekorClient
 		}
+	}
+	if certRef == "" || options.EnableExperimental() {
 		co.RootCerts, err = fulcio.GetRoots()
 		if err != nil {
 			return fmt.Errorf("getting Fulcio roots: %w", err)
@@ -113,11 +113,11 @@ func VerifyBlobCmd(ctx context.Context, ko options.KeyOpts, certRef, certEmail,
 	// Keys are optional!
 	switch {
 	case ko.KeyRef != "":
-		verifier, err = sigs.PublicKeyFromKeyRef(ctx, ko.KeyRef)
+		co.SigVerifier, err = sigs.PublicKeyFromKeyRef(ctx, ko.KeyRef)
 		if err != nil {
 			return fmt.Errorf("loading public key: %w", err)
 		}
-		pkcs11Key, ok := verifier.(*pkcs11key.Key)
+		pkcs11Key, ok := co.SigVerifier.(*pkcs11key.Key)
 		if ok {
 			defer pkcs11Key.Close()
 		}
@@ -127,7 +127,7 @@ func VerifyBlobCmd(ctx context.Context, ko options.KeyOpts, certRef, certEmail,
 			return fmt.Errorf("opening piv token: %w", err)
 		}
 		defer sk.Close()
-		verifier, err = sk.Verifier()
+		co.SigVerifier, err = sk.Verifier()
 		if err != nil {
 			return fmt.Errorf("loading public key from token: %w", err)
 		}
@@ -137,8 +137,7 @@ func VerifyBlobCmd(ctx context.Context, ko options.KeyOpts, certRef, certEmail,
 			return err
 		}
 		if certChain == "" {
-			// If no certChain is passed, the Fulcio root certificate will be used
-			verifier, err = cosign.ValidateAndUnpackCert(cert, co)
+			co.SigVerifier, err = cosign.ValidateAndUnpackCert(cert, co)
 			if err != nil {
 				return err
 			}
@@ -148,7 +147,7 @@ func VerifyBlobCmd(ctx context.Context, ko options.KeyOpts, certRef, certEmail,
 			if err != nil {
 				return err
 			}
-			verifier, err = cosign.ValidateAndUnpackCertWithChain(cert, chain, co)
+			co.SigVerifier, err = cosign.ValidateAndUnpackCertWithChain(cert, chain, co)
 			if err != nil {
 				return err
 			}
@@ -169,9 +168,9 @@ func VerifyBlobCmd(ctx context.Context, ko options.KeyOpts, certRef, certEmail,
 		cert, err = loadCertFromPEM(certBytes)
 		if err != nil {
 			// check if cert is actually a public key
-			verifier, err = sigs.LoadPublicKeyRaw(certBytes, crypto.SHA256)
+			co.SigVerifier, err = sigs.LoadPublicKeyRaw(certBytes, crypto.SHA256)
 		} else {
-			verifier, err = cosign.ValidateAndUnpackCert(cert, co)
+			co.SigVerifier, err = cosign.ValidateAndUnpackCert(cert, co)
 			if err != nil {
 				return err
 			}
@@ -191,6 +190,8 @@ func VerifyBlobCmd(ctx context.Context, ko options.KeyOpts, certRef, certEmail,
 		}
 
 		// Iterate through and try to find a matching Rekor entry.
+		// This does not support intoto properly! c/f extractCerts and
+		// the verifier.
 		for _, u := range uuids {
 			tlogEntry, err := cosign.GetTlogEntry(ctx, co.RekorClient, u)
 			if err != nil {
@@ -205,13 +206,14 @@ func VerifyBlobCmd(ctx context.Context, ko options.KeyOpts, certRef, certEmail,
 			}
 
 			cert := certs[0]
-			verifier, err := cosign.ValidateAndUnpackCert(cert, co)
+			co.SigVerifier, err = cosign.ValidateAndUnpackCert(cert, co)
 			if err != nil {
 				continue
 			}
 
-			// We found a succesful Rekor entry!
-			if err := verifyBlob(ctx, ko, co, blobBytes, sig, verifier, cert, tlogEntry); err == nil {
+			if err := verifyBlob(ctx, co, blobBytes, sig, cert,
+				ko.BundlePath, tlogEntry); err == nil {
+				// We found a succesful Rekor entry!
 				fmt.Fprintln(os.Stderr, "Verified OK")
 				return nil
 			}
@@ -229,17 +231,11 @@ We recommend requesting the certificate/signature from the original signer of th
 
 	// Use the DSSE verifier if the payload is a DSSE with the In-Toto format.
 	if isIntotoDSSE(blobBytes) {
-		verifier = dsse.WrapVerifier(verifier)
+		co.SigVerifier = dsse.WrapVerifier(co.SigVerifier)
 	}
 
-	// Verify Blob main entry point. This will perform the following:
-	//     1. Verifies the signature on the blob using the provided verifier.
-	//     2. Checks for transparency log entry presence:
-	//          a. Verifies the Rekor entry in the bundle, if provided. OR
-	//          b. Uses the provided Rekor entry (may have been retrieved through Redis search) OR
-	//          c. If experimental mode is enabled, does a Rekor online lookup for an entry.
-	//     3. If the certificate is expired, uses the verified Rekor entry to check expiration.
-	if err := verifyBlob(ctx, ko, co, blobBytes, sig, verifier, cert, nil); err != nil {
+	// Performs all blob verification.
+	if err := verifyBlob(ctx, co, blobBytes, sig, cert, ko.BundlePath, nil); err != nil {
 		return err
 	}
 
@@ -247,12 +243,29 @@ We recommend requesting the certificate/signature from the original signer of th
 	return nil
 }
 
-func verifyBlob(ctx context.Context, ko options.KeyOpts, co *cosign.CheckOpts,
-	blobBytes []byte, sig string, verifier signature.Verifier,
-	cert *x509.Certificate,
-	e *models.LogEntryAnon) error {
+// Verify Blob main entry point. This will perform the following:
+//     1. Verifies the signature on the blob using the provided verifier.
+//     2. Checks for transparency log entry presence:
+//          a. Verifies the Rekor entry in the bundle, if provided. OR
+//          b. Uses the provided Rekor entry (may have been retrieved through Redis search) OR
+//          c. If experimental mode is enabled, does a Rekor online lookup for an entry.
+//     3. If the certificate is expired, uses the verified Rekor entry to check expiration.
+// TODO: Make a version of this public. This could be VerifyBlobCmd, but we need to
+// clean up the args into CheckOpts or use KeyOpts here to resolve different KeyOpts.
+func verifyBlob(ctx context.Context, co *cosign.CheckOpts,
+	blobBytes []byte, sig string, cert *x509.Certificate,
+	bundlePath string, e *models.LogEntryAnon) error {
+	if cert != nil {
+		// This would have already be done in the main entrypoint, but do this for robustness.
+		var err error
+		co.SigVerifier, err = cosign.ValidateAndUnpackCert(cert, co)
+		if err != nil {
+			return err
+		}
+	}
+
 	// 1. Verify the signature.
-	if err := verifier.VerifySignature(bytes.NewReader([]byte(sig)), bytes.NewReader(blobBytes)); err != nil {
+	if err := co.SigVerifier.VerifySignature(bytes.NewReader([]byte(sig)), bytes.NewReader(blobBytes)); err != nil {
 		return err
 	}
 
@@ -262,8 +275,8 @@ func verifyBlob(ctx context.Context, ko options.KeyOpts, co *cosign.CheckOpts,
 	// 2. Checks for transparency log entry presence:
 	switch {
 	// a. We have a local bundle.
-	case ko.BundlePath != "":
-		bundle, err := verifyRekorBundle(ctx, ko.BundlePath, cert, co.RekorClient)
+	case bundlePath != "":
+		bundle, err := verifyRekorBundle(ctx, bundlePath, co.RekorClient)
 		if err != nil {
 			return err
 		}
@@ -389,7 +402,7 @@ func payloadBytes(blobRef string) ([]byte, error) {
 
 // TODO: RekorClient can be removed when SIGSTORE_TRUST_REKOR_API_PUBLIC_KEY
 // is removed.
-func verifyRekorBundle(ctx context.Context, bundlePath string, cert *x509.Certificate, rekorClient *client.Rekor) (*bundle.RekorPayload, error) {
+func verifyRekorBundle(ctx context.Context, bundlePath string, rekorClient *client.Rekor) (*bundle.RekorPayload, error) {
 	b, err := cosign.FetchLocalSignedPayloadFromPath(bundlePath)
 	if err != nil {
 		return nil, err
