@@ -22,7 +22,9 @@ import (
 	"testing"
 
 	"github.com/secure-systems-lab/go-securesystemslib/dsse"
+	"github.com/sigstore/cosign/cmd/cosign/cli/rekor"
 	"github.com/sigstore/cosign/pkg/cosign"
+	"github.com/sigstore/rekor/pkg/generated/client"
 )
 
 func TestSignaturesRef(t *testing.T) {
@@ -131,6 +133,78 @@ func TestIsIntotoDSSEWithBytes(t *testing.T) {
 		{
 			envelope:     []byte("MEUCIQDBmE1ZRFjUVic1hzukesJlmMFG1JqWWhcthnhawTeBNQIga3J9/WKsNlSZaySnl8V360bc2S8dIln2/qo186EfjHA="),
 			isIntotoDSSE: false,
+		},
+	}
+	for _, tt := range tts {
+		envlopeBytes, _ := json.Marshal(tt.envelope)
+		got := isIntotoDSSE(envlopeBytes)
+		if got != tt.isIntotoDSSE {
+			t.Fatalf("unexpected envelope content")
+		}
+	}
+}
+
+// Does not test identity options, only blob verification with different
+// options.
+func TestVerifyBlob(t *testing.T) {
+	rekor.NewClient = func(string) (*client.Rekor, error) { return nil, nil }
+	tts := []struct {
+		name         string
+		blob         string
+		signature    string
+		publicKeyRef string
+		certRef      string
+		bundle       string
+		experimental bool
+		shouldErr    bool
+	}{
+		{
+			name:         "valid public key and signature",
+			blob:         "",
+			signature:    "",
+			publicKeyRef: "",
+			experimental: false,
+			shouldErr:    false,
+		},
+		{
+			name:         "valid public key and signature - experimental",
+			blob:         "",
+			signature:    "",
+			publicKeyRef: "",
+			experimental: true,
+			shouldErr:    false,
+		},
+		{
+			name:         "unexpired certificate and signature passes",
+			blob:         "",
+			signature:    "",
+			certRef:      "",
+			experimental: false,
+			shouldErr:    false,
+		},
+		{
+			name:         "unexpired certificate and signature - experimental",
+			blob:         "",
+			signature:    "",
+			publicKeyRef: "",
+			experimental: true,
+			shouldErr:    false,
+		},
+		{
+			name:         "expired certificate and signature fails",
+			blob:         "",
+			signature:    "",
+			certRef:      "",
+			experimental: false,
+			shouldErr:    true,
+		},
+		{
+			name:         "expired certificate and signature - experimental",
+			blob:         "",
+			signature:    "",
+			publicKeyRef: "",
+			experimental: true,
+			shouldErr:    true,
 		},
 	}
 	for _, tt := range tts {
