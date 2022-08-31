@@ -260,7 +260,7 @@ func verifyBlob(ctx context.Context, co *cosign.CheckOpts,
 		var err error
 		co.SigVerifier, err = cosign.ValidateAndUnpackCert(cert, co)
 		if err != nil {
-			return err
+			return fmt.Errorf("validating cert: %w", err)
 		}
 	}
 
@@ -283,20 +283,24 @@ func verifyBlob(ctx context.Context, co *cosign.CheckOpts,
 		validityTime = time.Unix(bundle.IntegratedTime, 0)
 		fmt.Fprintf(os.Stderr, "tlog entry verified offline\n")
 	// b. We can make an online lookup to the transparency log.
-	case options.EnableExperimental() && e == nil:
+	case co.RekorClient != nil && e == nil:
 		// 2b. If experimental mode is enabled, does a Rekor online lookup for an entry.
-		var err error
+		var tlogFindErr error
 		if cert == nil {
 			pub, err := co.SigVerifier.PublicKey(co.PKOpts...)
 			if err != nil {
 				return err
 			}
-			e, err = tlogFindPublicKey(ctx, co.RekorClient, blobBytes, sig, pub)
+			e, tlogFindErr = tlogFindPublicKey(ctx, co.RekorClient, blobBytes, sig, pub)
 		} else {
-			e, err = tlogFindCertificate(ctx, co.RekorClient, blobBytes, sig, cert)
+			e, tlogFindErr = tlogFindCertificate(ctx, co.RekorClient, blobBytes, sig, cert)
 		}
-		if err != nil {
-			return err
+		if tlogFindErr != nil {
+			// TODO: Should we error out here if we can't find the TLOG entry?
+			// Likely no: if someone did not upload to the TLOG, we may still verify
+			// in case it's a public key of a still-valid certificate.
+			fmt.Fprintf(os.Stderr, "could not find entry in tlog: %s", tlogFindErr)
+			break
 		}
 		fallthrough
 	// We are provided a log entry, possibly from above, or search.
