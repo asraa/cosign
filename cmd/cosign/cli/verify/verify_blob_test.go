@@ -382,9 +382,22 @@ func TestVerifyBlob(t *testing.T) {
 				expiredLeafCert, true),
 			shouldErr: false,
 		},
+		{
+			name:         "valid signature with expired certificate - experimental bad rekor entry",
+			blob:         blobBytes,
+			signature:    blobSignature,
+			sigVerifier:  signer,
+			cert:         expiredLeafCert,
+			experimental: true,
+			// This is the wrong signer for the SET!
+			rekorEntry: makeRekorEntry(t, *signer, blobBytes, []byte(blobSignature),
+				expiredLeafCert, true),
+			shouldErr: true,
+		},
 	}
 	for _, tt := range tts {
 		t.Run(tt.name, func(t *testing.T) {
+			tt := tt
 			var mClient client.Rekor
 			mClient.Entries = &mock.EntriesClient{Entries: tt.rekorEntry}
 			co := &cosign.CheckOpts{
