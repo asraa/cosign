@@ -675,8 +675,8 @@ func TestVerifyBlobCmdWithBundle(t *testing.T) {
 		err = VerifyBlobCmd(context.Background(),
 			options.KeyOpts{BundlePath: bundlePath},
 			"",       /*certRef*/ // Cert is fetched from bundle
-			"",       /*certEmail*/
-			"",       /*certOidcIssuer*/
+			identity, /*certEmail*/
+			issuer,   /*certOidcIssuer*/
 			"",       /*certChain*/ // Chain is fetched from TUF/SIGSTORE_ROOT_FILE
 			"",       /*sigRef*/    // Sig is fetched from bundle
 			blobPath, /*blobRef*/
@@ -844,6 +844,82 @@ func TestVerifyBlobCmdWithBundle(t *testing.T) {
 			false /*enforceSCT*/)
 		if err == nil || !strings.Contains(err.Error(), "unable to verify SET") {
 			t.Fatalf("expected error verifying SET, got %v", err)
+		}
+	})
+	t.Run("Mismatched certificate email", func(t *testing.T) {
+		identity := "hello@foo.com"
+		issuer := "issuer"
+		leafCert, _, leafPemCert, signer := keyless.genLeafCert(t, identity, issuer)
+
+		// Create blob
+		blob := "someblob"
+
+		// Sign blob with private key
+		sig, err := signer.SignMessage(bytes.NewReader([]byte(blob)))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Create bundle
+		entry := genRekorEntry(t, hashedrekord.KIND, hashedrekord.New().DefaultVersion(), []byte(blob), leafPemCert, sig)
+		b := createBundle(t, sig, leafPemCert, keyless.rekorLogID, leafCert.NotBefore.Unix()+1, entry)
+		b.Bundle.SignedEntryTimestamp = keyless.rekorSignPayload(t, b.Bundle.Payload)
+		bundlePath := writeBundleFile(t, keyless.td, b, "bundle.json")
+		blobPath := writeBlobFile(t, keyless.td, blob, "blob.txt")
+
+		// Verify command
+		err = VerifyBlobCmd(context.Background(),
+			options.KeyOpts{BundlePath: bundlePath},
+			"",                    /*certRef*/ // Cert is fetched from bundle
+			"invalid@example.com", /*certEmail*/
+			issuer,                /*certOidcIssuer*/
+			"",                    /*certChain*/ // Chain is fetched from TUF/SIGSTORE_ROOT_FILE
+			"",                    /*sigRef*/    // Sig is fetched from bundle
+			blobPath,              /*blobRef*/
+			// GitHub identity flags start
+			"", "", "", "", "",
+			// GitHub identity flags end
+			false /*enforceSCT*/)
+		if err == nil || !strings.Contains(err.Error(), "expected email not found in certificate") {
+			t.Fatalf("expected error with mismatched identity, got %v", err)
+		}
+	})
+	t.Run("Mismatched certificate issuer", func(t *testing.T) {
+		identity := "hello@foo.com"
+		issuer := "issuer"
+		leafCert, _, leafPemCert, signer := keyless.genLeafCert(t, identity, issuer)
+
+		// Create blob
+		blob := "someblob"
+
+		// Sign blob with private key
+		sig, err := signer.SignMessage(bytes.NewReader([]byte(blob)))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Create bundle
+		entry := genRekorEntry(t, hashedrekord.KIND, hashedrekord.New().DefaultVersion(), []byte(blob), leafPemCert, sig)
+		b := createBundle(t, sig, leafPemCert, keyless.rekorLogID, leafCert.NotBefore.Unix()+1, entry)
+		b.Bundle.SignedEntryTimestamp = keyless.rekorSignPayload(t, b.Bundle.Payload)
+		bundlePath := writeBundleFile(t, keyless.td, b, "bundle.json")
+		blobPath := writeBlobFile(t, keyless.td, blob, "blob.txt")
+
+		// Verify command
+		err = VerifyBlobCmd(context.Background(),
+			options.KeyOpts{BundlePath: bundlePath},
+			"",        /*certRef*/ // Cert is fetched from bundle
+			identity,  /*certEmail*/
+			"invalid", /*certOidcIssuer*/
+			"",        /*certChain*/ // Chain is fetched from TUF/SIGSTORE_ROOT_FILE
+			"",        /*sigRef*/    // Sig is fetched from bundle
+			blobPath,  /*blobRef*/
+			// GitHub identity flags start
+			"", "", "", "", "",
+			// GitHub identity flags end
+			false /*enforceSCT*/)
+		if err == nil || !strings.Contains(err.Error(), "expected oidc issuer not found in certificate") {
+			t.Fatalf("expected error with mismatched issuer, got %v", err)
 		}
 	})
 }

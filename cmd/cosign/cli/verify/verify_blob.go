@@ -168,7 +168,7 @@ func VerifyBlobCmd(ctx context.Context, ko options.KeyOpts, certRef, certEmail,
 		if b.Cert == "" {
 			return fmt.Errorf("bundle does not contain cert for verification, please provide public key")
 		}
-		// cert can either be a cert or public key
+		// b.Cert can either be a certificate or public key
 		certBytes := []byte(b.Cert)
 		if isb64(certBytes) {
 			certBytes, _ = base64.StdEncoding.DecodeString(b.Cert)
@@ -246,14 +246,15 @@ We recommend requesting the certificate/signature from the original signer of th
 	return nil
 }
 
-// Verify Blob main entry point. This will perform the following:
-//     1. Verifies the signature on the blob using the provided verifier.
-//     2. Checks for transparency log entry presence:
-//          a. Verifies the Rekor entry in the bundle, if provided. OR
-//          b. If we don't have a Rekor entry retrieved via cert, do an online lookup (assuming
-//             we are in experimental mode).
-//          c. Uses the provided Rekor entry (may have been retrieved through Redis search) OR
-//     3. If a certificate is provided, check it's expiration.
+/* Verify Blob main entry point. This will perform the following:
+   1. Verifies the signature on the blob using the provided verifier.
+   2. Checks for transparency log entry presence:
+        a. Verifies the Rekor entry in the bundle, if provided. OR
+        b. If we don't have a Rekor entry retrieved via cert, do an online lookup (assuming
+           we are in experimental mode).
+        c. Uses the provided Rekor entry (may have been retrieved through Redis search) OR
+   3. If a certificate is provided, check it's expiration.
+*/
 // TODO: Make a version of this public. This could be VerifyBlobCmd, but we need to
 // clean up the args into CheckOpts or use KeyOpts here to resolve different KeyOpts.
 func verifyBlob(ctx context.Context, co *cosign.CheckOpts,
