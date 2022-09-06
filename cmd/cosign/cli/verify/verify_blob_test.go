@@ -808,6 +808,44 @@ func TestVerifyBlobCmdWithBundle(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
+	t.Run("Invalid blob signature", func(t *testing.T) {
+		identity := "hello@foo.com"
+		issuer := "issuer"
+		leafCert, _, leafPemCert, signer := keyless.genLeafCert(t, identity, issuer)
+
+		// Create blob
+		blob := "someblob"
+
+		// Sign blob with private key
+		sig, err := signer.SignMessage(bytes.NewReader([]byte(blob)))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Create bundle
+		entry := genRekorEntry(t, hashedrekord.KIND, hashedrekord.New().DefaultVersion(), []byte(blob), leafPemCert, sig)
+		b := createBundle(t, sig, leafPemCert, keyless.rekorLogID, leafCert.NotBefore.Unix()+1, entry)
+		b.Bundle.SignedEntryTimestamp = []byte{'i', 'n', 'v', 'a', 'l', 'i', 'd'}
+		bundlePath := writeBundleFile(t, keyless.td, b, "bundle.json")
+		blobPath := writeBlobFile(t, keyless.td, blob, "blob.txt")
+
+		// Verify command
+		err = VerifyBlobCmd(context.Background(),
+			options.KeyOpts{BundlePath: bundlePath},
+			"",       /*certRef*/ // Cert is fetched from bundle
+			"",       /*certEmail*/
+			"",       /*certOidcIssuer*/
+			"",       /*certChain*/ // Chain is fetched from TUF/SIGSTORE_ROOT_FILE
+			"",       /*sigRef*/    // Sig is fetched from bundle
+			blobPath, /*blobRef*/
+			// GitHub identity flags start
+			"", "", "", "", "",
+			// GitHub identity flags end
+			false /*enforceSCT*/)
+		if err == nil || !strings.Contains(err.Error(), "unable to verify SET") {
+			t.Fatalf("expected error verifying SET, got %v", err)
+		}
+	})
 }
 
 type keylessStack struct {
