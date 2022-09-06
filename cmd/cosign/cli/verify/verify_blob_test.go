@@ -26,25 +26,34 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/cyberphone/json-canonicalization/go/src/webpki.org/jsoncanonicalizer"
 	"github.com/go-openapi/swag"
-	"github.com/secure-systems-lab/go-securesystemslib/dsse"
+	ssldsse "github.com/secure-systems-lab/go-securesystemslib/dsse"
+	"github.com/sigstore/cosign/cmd/cosign/cli/options"
 	"github.com/sigstore/cosign/internal/pkg/cosign/rekor/mock"
 	"github.com/sigstore/cosign/pkg/cosign"
 	"github.com/sigstore/cosign/pkg/cosign/bundle"
 	sigs "github.com/sigstore/cosign/pkg/signature"
+	ctypes "github.com/sigstore/cosign/pkg/types"
 	"github.com/sigstore/cosign/test"
 	"github.com/sigstore/rekor/pkg/generated/client"
 	"github.com/sigstore/rekor/pkg/generated/models"
+	"github.com/sigstore/rekor/pkg/pki"
 	"github.com/sigstore/rekor/pkg/types"
-	hashedrekord "github.com/sigstore/rekor/pkg/types/hashedrekord/v0.0.1"
+	"github.com/sigstore/rekor/pkg/types/hashedrekord"
+	hashedrekord_v001 "github.com/sigstore/rekor/pkg/types/hashedrekord/v0.0.1"
+	"github.com/sigstore/rekor/pkg/types/intoto"
+	"github.com/sigstore/rekor/pkg/types/rekord"
 	"github.com/sigstore/sigstore/pkg/cryptoutils"
 	"github.com/sigstore/sigstore/pkg/signature"
+	"github.com/sigstore/sigstore/pkg/signature/dsse"
 	signatureoptions "github.com/sigstore/sigstore/pkg/signature/options"
 )
 
@@ -115,14 +124,14 @@ func TestSignaturesBundle(t *testing.T) {
 
 func TestIsIntotoDSSEWithEnvelopes(t *testing.T) {
 	tts := []struct {
-		envelope     dsse.Envelope
+		envelope     ssldsse.Envelope
 		isIntotoDSSE bool
 	}{
 		{
-			envelope: dsse.Envelope{
+			envelope: ssldsse.Envelope{
 				PayloadType: "application/vnd.in-toto+json",
 				Payload:     base64.StdEncoding.EncodeToString([]byte("This is a test")),
-				Signatures:  []dsse.Signature{},
+				Signatures:  []ssldsse.Signature{},
 			},
 			isIntotoDSSE: true,
 		},
@@ -250,13 +259,23 @@ func TestVerifyBlob(t *testing.T) {
 			shouldErr:    false,
 		},
 		{
-			name:         "valid signature with public key - experimental",
+			name:         "valid signature with public key - experimental no rekor fail",
 			blob:         blobBytes,
 			signature:    blobSignature,
 			sigVerifier:  signer,
 			experimental: true,
 			rekorEntry:   nil,
-			shouldErr:    false,
+			shouldErr:    true,
+		},
+		{
+			name:         "valid signature with public key - experimental rekor entry success",
+			blob:         blobBytes,
+			signature:    blobSignature,
+			sigVerifier:  signer,
+			experimental: true,
+			rekorEntry: makeRekorEntry(t, *rekorSigner, blobBytes, []byte(blobSignature),
+				pubKeyBytes, true),
+			shouldErr: false,
 		},
 		{
 			name:         "valid signature with public key - good bundle provided",
@@ -278,7 +297,6 @@ func TestVerifyBlob(t *testing.T) {
 				unexpiredCertPem, true),
 			shouldErr: true,
 		},
-		/* TODO: These will be fixed by Cody's fix.
 		{
 			name:         "valid signature with public key - bad bundle cert mismatch",
 			blob:         blobBytes,
@@ -309,7 +327,6 @@ func TestVerifyBlob(t *testing.T) {
 				pubKeyBytes, true),
 			shouldErr: true,
 		},
-		*/
 		{
 			name:         "invalid signature with public key",
 			blob:         blobBytes,
@@ -335,7 +352,6 @@ func TestVerifyBlob(t *testing.T) {
 			experimental: false,
 			shouldErr:    false,
 		},
-		/* TODO: These will be fixed by Cody's fix.
 		{
 			name:         "valid signature with unexpired certificate - bad bundle cert mismatch",
 			blob:         blobBytes,
@@ -355,7 +371,7 @@ func TestVerifyBlob(t *testing.T) {
 			experimental: false,
 			cert:         unexpiredLeafCert,
 			bundlePath: makeLocalBundle(t, *rekorSigner, blobBytes, []byte(makeSignature(blobBytes)),
-				unexpiredLeafPem, true),
+				unexpiredCertPem, true),
 			shouldErr: true,
 		},
 		{
@@ -366,10 +382,9 @@ func TestVerifyBlob(t *testing.T) {
 			experimental: false,
 			cert:         unexpiredLeafCert,
 			bundlePath: makeLocalBundle(t, *rekorSigner, otherBytes, []byte(otherSignature),
-				unexpiredLeafPem, true),
+				unexpiredCertPem, true),
 			shouldErr: true,
 		},
-		*/
 		{
 			name:         "invalid signature with unexpired certificate",
 			blob:         blobBytes,
@@ -534,7 +549,7 @@ func makeRekorEntry(t *testing.T, rekorSigner signature.ECDSASignerVerifier,
 		t.Fatal(err)
 	}
 
-	hashedrekord := &hashedrekord.V001Entry{}
+	hashedrekord := &hashedrekord_v001.V001Entry{}
 	h := sha256.Sum256(pyld)
 	pe, err := hashedrekord.CreateFromArtifactProperties(ctx, types.ArtifactProperties{
 		ArtifactHash:   hex.EncodeToString(h[:]),
@@ -632,6 +647,268 @@ func makeLocalBundle(t *testing.T, rekorSigner signature.ECDSASignerVerifier,
 	return bundlePath
 }
 
+func TestVerifyBlobCmdWithBundle(t *testing.T) {
+	keyless := newKeylessStack(t)
+
+	t.Run("Normal verification", func(t *testing.T) {
+		identity := "hello@foo.com"
+		issuer := "issuer"
+		leafCert, _, leafPemCert, signer := keyless.genLeafCert(t, identity, issuer)
+
+		// Create blob
+		blob := "someblob"
+
+		// Sign blob with private key
+		sig, err := signer.SignMessage(bytes.NewReader([]byte(blob)))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Create bundle
+		entry := genRekorEntry(t, hashedrekord.KIND, hashedrekord.New().DefaultVersion(), []byte(blob), leafPemCert, sig)
+		b := createBundle(t, sig, leafPemCert, keyless.rekorLogID, leafCert.NotBefore.Unix()+1, entry)
+		b.Bundle.SignedEntryTimestamp = keyless.rekorSignPayload(t, b.Bundle.Payload)
+		bundlePath := writeBundleFile(t, keyless.td, b, "bundle.json")
+		blobPath := writeBlobFile(t, keyless.td, blob, "blob.txt")
+
+		// Verify command
+		err = VerifyBlobCmd(context.Background(),
+			options.KeyOpts{BundlePath: bundlePath},
+			"",       /*certRef*/ // Cert is fetched from bundle
+			"",       /*certEmail*/
+			"",       /*certOidcIssuer*/
+			"",       /*certChain*/ // Chain is fetched from TUF/SIGSTORE_ROOT_FILE
+			"",       /*sigRef*/    // Sig is fetched from bundle
+			blobPath, /*blobRef*/
+			// GitHub identity flags start
+			"", "", "", "", "",
+			// GitHub identity flags end
+			false /*enforceSCT*/)
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("Mismatched cert/sig", func(t *testing.T) {
+		// This test ensures that the signature and cert at the top level in the LocalSignedPayload must be identical to the ones in the RekorBundle.
+		identity := "hello@foo.com"
+		issuer := "issuer"
+		leafCert, _, leafPemCert, signer := keyless.genLeafCert(t, identity, issuer)
+		_, _, leafPemCert2, signer2 := keyless.genLeafCert(t, identity, issuer)
+
+		// Create blob
+		blob := "someblob"
+
+		sig, err := signer.SignMessage(bytes.NewReader([]byte(blob)))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		sig2, err := signer2.SignMessage(bytes.NewReader([]byte(blob)))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Create bundle
+		entry := genRekorEntry(t, hashedrekord.KIND, hashedrekord.New().DefaultVersion(), []byte(blob), leafPemCert2, sig2)
+		b := createBundle(t, sig, leafPemCert, keyless.rekorLogID, leafCert.NotBefore.Unix()+1, entry)
+		b.Bundle.SignedEntryTimestamp = keyless.rekorSignPayload(t, b.Bundle.Payload)
+		bundlePath := writeBundleFile(t, keyless.td, b, "bundle.json")
+		blobPath := writeBlobFile(t, keyless.td, blob, "blob.txt")
+
+		// Verify command
+		err = VerifyBlobCmd(context.Background(),
+			options.KeyOpts{BundlePath: bundlePath},
+			"",       /*certRef*/ // Cert is fetched from bundle
+			"",       /*certEmail*/
+			"",       /*certOidcIssuer*/
+			"",       /*certChain*/ // Chain is fetched from TUF/SIGSTORE_ROOT_FILE
+			"",       /*sigRef*/    // Sig is fetched from bundle
+			blobPath, /*blobRef*/
+			// GitHub identity flags start
+			"", "", "", "", "",
+			// GitHub identity flags end
+			false /*enforceSCT*/)
+		if err == nil {
+			t.Fatal("expecting err due to mismatched signatures, got nil")
+		}
+	})
+	t.Run("Expired cert", func(t *testing.T) {
+		identity := "hello@foo.com"
+		issuer := "issuer"
+		leafCert, _, leafPemCert, signer := keyless.genLeafCert(t, identity, issuer)
+
+		// Create blob
+		blob := "someblob"
+
+		// Sign blob with private key
+		sig, err := signer.SignMessage(bytes.NewReader([]byte(blob)))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Create bundle
+		entry := genRekorEntry(t, hashedrekord.KIND, hashedrekord.New().DefaultVersion(), []byte(blob), leafPemCert, sig)
+		b := createBundle(t, sig, leafPemCert, keyless.rekorLogID, leafCert.NotBefore.Unix()-1, entry)
+		b.Bundle.SignedEntryTimestamp = keyless.rekorSignPayload(t, b.Bundle.Payload)
+		bundlePath := writeBundleFile(t, keyless.td, b, "bundle.json")
+		blobPath := writeBlobFile(t, keyless.td, blob, "blob.txt")
+
+		// Verify command
+		err = VerifyBlobCmd(context.Background(),
+			options.KeyOpts{BundlePath: bundlePath},
+			"",       /*certRef*/ // Cert is fetched from bundle
+			"",       /*certEmail*/
+			"",       /*certOidcIssuer*/
+			"",       /*certChain*/ // Chain is fetched from TUF/SIGSTORE_ROOT_FILE
+			"",       /*sigRef*/    // Sig is fetched from bundle
+			blobPath, /*blobRef*/
+			// GitHub identity flags start
+			"", "", "", "", "",
+			// GitHub identity flags end
+			false /*enforceSCT*/)
+		if err == nil {
+			t.Fatal("expected error due to expired cert, received nil")
+		}
+	})
+	t.Run("Attestation", func(t *testing.T) {
+		identity := "hello@foo.com"
+		issuer := "issuer"
+		leafCert, _, leafPemCert, signer := keyless.genLeafCert(t, identity, issuer)
+
+		stmt := `{"_type":"https://in-toto.io/Statement/v0.1","predicateType":"customFoo","subject":[{"name":"subject","digest":{"sha256":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"}}],"predicate":{}}`
+		wrapped := dsse.WrapSigner(signer, ctypes.IntotoPayloadType)
+		signedPayload, err := wrapped.SignMessage(bytes.NewReader([]byte(stmt)), signatureoptions.WithContext(context.Background()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		// intoto sig = json-serialized dsse envelope
+		sig := signedPayload
+
+		// Create bundle
+		entry := genRekorEntry(t, intoto.KIND, intoto.New().DefaultVersion(), signedPayload, leafPemCert, sig)
+		b := createBundle(t, sig, leafPemCert, keyless.rekorLogID, leafCert.NotBefore.Unix()+1, entry)
+		b.Bundle.SignedEntryTimestamp = keyless.rekorSignPayload(t, b.Bundle.Payload)
+		bundlePath := writeBundleFile(t, keyless.td, b, "bundle.json")
+		blobPath := writeBlobFile(t, keyless.td, string(signedPayload), "attestation.txt")
+
+		// Verify command
+		err = VerifyBlobCmd(context.Background(),
+			options.KeyOpts{BundlePath: bundlePath},
+			"",       /*certRef*/ // Cert is fetched from bundle
+			"",       /*certEmail*/
+			"",       /*certOidcIssuer*/
+			"",       /*certChain*/ // Chain is fetched from TUF/SIGSTORE_ROOT_FILE
+			"",       /*sigRef*/    // Sig is fetched from bundle
+			blobPath, /*blobRef*/
+			// GitHub identity flags start
+			"", "", "", "", "",
+			// GitHub identity flags end
+			false /*enforceSCT*/)
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+type keylessStack struct {
+	rootCert    *x509.Certificate
+	rootPriv    *ecdsa.PrivateKey
+	rootPemCert []byte
+	subCert     *x509.Certificate
+	subPriv     *ecdsa.PrivateKey
+	subPemCert  []byte
+	rekorSigner *signature.ECDSASignerVerifier
+	rekorLogID  string
+	td          string // temporary directory
+}
+
+func newKeylessStack(t *testing.T) *keylessStack {
+	stack := &keylessStack{td: t.TempDir()}
+	stack.rootCert, stack.rootPriv, _ = test.GenerateRootCa()
+	stack.rootPemCert, _ = cryptoutils.MarshalCertificateToPEM(stack.rootCert)
+	stack.subCert, stack.subPriv, _ = test.GenerateSubordinateCa(stack.rootCert, stack.rootPriv)
+	stack.subPemCert, _ = cryptoutils.MarshalCertificateToPEM(stack.subCert)
+
+	stack.genChainFile(t)
+	stack.genRekor(t)
+	return stack
+}
+
+func (s *keylessStack) genLeafCert(t *testing.T, subject string, issuer string) (*x509.Certificate, *ecdsa.PrivateKey, []byte, *signature.ECDSASignerVerifier) {
+	cert, priv, _ := test.GenerateLeafCert(subject, issuer, s.subCert, s.subPriv)
+	pemCert, _ := cryptoutils.MarshalCertificateToPEM(cert)
+	signer, err := signature.LoadECDSASignerVerifier(priv, crypto.SHA256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cert, priv, pemCert, signer
+}
+
+func (s *keylessStack) genChainFile(t *testing.T) {
+	var chain []byte
+	chain = append(chain, s.subPemCert...)
+	chain = append(chain, s.rootPemCert...)
+	tmpChainFile, err := os.CreateTemp(s.td, "cosign_fulcio_chain_*.cert")
+	if err != nil {
+		t.Fatalf("failed to create temp chain file: %v", err)
+	}
+	defer tmpChainFile.Close()
+	if _, err := tmpChainFile.Write(chain); err != nil {
+		t.Fatalf("failed to write chain file: %v", err)
+	}
+	// Override for Fulcio root so it doesn't use TUF
+	t.Setenv("SIGSTORE_ROOT_FILE", tmpChainFile.Name())
+}
+
+func (s *keylessStack) genRekor(t *testing.T) {
+	// Create Rekor private key and write to disk
+	rekorPriv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.rekorSigner, err = signature.LoadECDSASignerVerifier(rekorPriv, crypto.SHA256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rekorPub := s.rekorSigner.Public()
+	pemRekor, err := cryptoutils.MarshalPublicKeyToPEM(rekorPub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpRekorPubFile, err := os.CreateTemp(s.td, "cosign_rekor_pub_*.key")
+	if err != nil {
+		t.Fatalf("failed to create temp rekor pub file: %v", err)
+	}
+	defer tmpRekorPubFile.Close()
+	if _, err := tmpRekorPubFile.Write(pemRekor); err != nil {
+		t.Fatalf("failed to write rekor pub file: %v", err)
+	}
+
+	// Calculate log ID, the digest of the Rekor public key
+	s.rekorLogID, err = getLogID(rekorPub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Override for Rekor public key so it doesn't use TUF
+	t.Setenv("SIGSTORE_REKOR_PUBLIC_KEY", tmpRekorPubFile.Name())
+}
+func (s *keylessStack) rekorSignPayload(t *testing.T, payload bundle.RekorPayload) []byte {
+	// Marshal payload, sign, and return SET
+	jsonPayload, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonicalized, err := jsoncanonicalizer.Transform(jsonPayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundleSig, err := s.rekorSigner.SignMessage(bytes.NewReader(canonicalized))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return bundleSig
+}
+
 // getLogID calculates the digest of a PKIX-encoded public key
 func getLogID(pub crypto.PublicKey) (string, error) {
 	pubBytes, err := x509.MarshalPKIXPublicKey(pub)
@@ -640,4 +917,86 @@ func getLogID(pub crypto.PublicKey) (string, error) {
 	}
 	digest := sha256.Sum256(pubBytes)
 	return hex.EncodeToString(digest[:]), nil
+}
+
+func genRekorEntry(t *testing.T, kind, version string, artifact []byte, cert []byte, sig []byte) string {
+	// Generate the Rekor Entry
+	entryImpl, err := createEntry(context.Background(), kind, version, artifact, cert, sig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entryBytes, err := entryImpl.Canonicalize(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return base64.StdEncoding.EncodeToString(entryBytes)
+}
+
+func createBundle(t *testing.T, sig []byte, certPem []byte, logID string, integratedTime int64, rekorEntry string) *cosign.LocalSignedPayload {
+	// Create bundle with:
+	// * Blob signature
+	// * Signing certificate
+	// * Bundle with a payload and signature over the payload
+	b := &cosign.LocalSignedPayload{
+		Base64Signature: base64.StdEncoding.EncodeToString(sig),
+		Cert:            string(certPem),
+		Bundle: &bundle.RekorBundle{
+			SignedEntryTimestamp: []byte{},
+			Payload: bundle.RekorPayload{
+				LogID:          logID,
+				IntegratedTime: integratedTime,
+				LogIndex:       1,
+				Body:           rekorEntry,
+			},
+		},
+	}
+
+	return b
+}
+
+func createEntry(ctx context.Context, kind, apiVersion string, blobBytes, certBytes, sigBytes []byte) (types.EntryImpl, error) {
+	props := types.ArtifactProperties{
+		PublicKeyBytes: certBytes,
+		PKIFormat:      string(pki.X509),
+	}
+	switch kind {
+	case rekord.KIND:
+		props.ArtifactBytes = blobBytes
+		props.SignatureBytes = sigBytes
+	case hashedrekord.KIND:
+		blobHash := sha256.Sum256(blobBytes)
+		props.ArtifactHash = strings.ToLower(hex.EncodeToString(blobHash[:]))
+		props.SignatureBytes = sigBytes
+	case intoto.KIND:
+		props.ArtifactBytes = blobBytes
+	default:
+		return nil, fmt.Errorf("unexpected entry kind: %s", kind)
+	}
+	proposedEntry, err := types.NewProposedEntry(ctx, kind, apiVersion, props)
+	if err != nil {
+		return nil, err
+	}
+	return types.NewEntry(proposedEntry)
+}
+
+func writeBundleFile(t *testing.T, td string, b *cosign.LocalSignedPayload, name string) string {
+	// Write bundle to disk
+	jsonBundle, err := json.Marshal(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundlePath := filepath.Join(td, name)
+	if err := os.WriteFile(bundlePath, jsonBundle, 0644); err != nil {
+		t.Fatal(err)
+	}
+	return bundlePath
+}
+
+func writeBlobFile(t *testing.T, td string, blob string, name string) string {
+	// Write blob to disk
+	blobPath := filepath.Join(td, name)
+	if err := os.WriteFile(blobPath, []byte(blob), 0644); err != nil {
+		t.Fatal(err)
+	}
+	return blobPath
 }

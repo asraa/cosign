@@ -19,6 +19,7 @@ import (
 	"bytes"
 	"context"
 	"crypto"
+	"crypto/sha256"
 	_ "crypto/sha256" // for `crypto.SHA256`
 	"crypto/x509"
 	"encoding/base64"
@@ -28,6 +29,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/go-openapi/runtime"
@@ -46,11 +48,17 @@ import (
 	ctypes "github.com/sigstore/cosign/pkg/types"
 	"github.com/sigstore/rekor/pkg/generated/client"
 	"github.com/sigstore/rekor/pkg/generated/models"
+	"github.com/sigstore/rekor/pkg/pki"
 	"github.com/sigstore/rekor/pkg/types"
-	hashedrekord "github.com/sigstore/rekor/pkg/types/hashedrekord/v0.0.1"
-	rekord "github.com/sigstore/rekor/pkg/types/rekord/v0.0.1"
+	"github.com/sigstore/rekor/pkg/types/hashedrekord"
+	hashedrekord_v001 "github.com/sigstore/rekor/pkg/types/hashedrekord/v0.0.1"
+	"github.com/sigstore/rekor/pkg/types/intoto"
+	intoto_v001 "github.com/sigstore/rekor/pkg/types/intoto/v0.0.1"
+	"github.com/sigstore/rekor/pkg/types/rekord"
+	rekord_v001 "github.com/sigstore/rekor/pkg/types/rekord/v0.0.1"
 	"github.com/sigstore/sigstore/pkg/cryptoutils"
 	"github.com/sigstore/sigstore/pkg/signature/dsse"
+	signatureoptions "github.com/sigstore/sigstore/pkg/signature/options"
 )
 
 func isb64(data []byte) bool {
@@ -229,11 +237,6 @@ We recommend requesting the certificate/signature from the original signer of th
 
 	}
 
-	// Use the DSSE verifier if the payload is a DSSE with the In-Toto format.
-	if isIntotoDSSE(blobBytes) {
-		co.SigVerifier = dsse.WrapVerifier(co.SigVerifier)
-	}
-
 	// Performs all blob verification.
 	if err := verifyBlob(ctx, co, blobBytes, sig, cert, ko.BundlePath, nil); err != nil {
 		return err
@@ -265,6 +268,11 @@ func verifyBlob(ctx context.Context, co *cosign.CheckOpts,
 		}
 	}
 
+	// Use the DSSE verifier if the payload is a DSSE with the In-Toto format.
+	if isIntotoDSSE(blobBytes) {
+		co.SigVerifier = dsse.WrapVerifier(co.SigVerifier)
+	}
+
 	// 1. Verify the signature.
 	if err := co.SigVerifier.VerifySignature(bytes.NewReader([]byte(sig)), bytes.NewReader(blobBytes)); err != nil {
 		return err
@@ -277,7 +285,20 @@ func verifyBlob(ctx context.Context, co *cosign.CheckOpts,
 	switch {
 	// a. We have a local bundle.
 	case bundlePath != "":
-		bundle, err := verifyRekorBundle(ctx, bundlePath, co.RekorClient)
+		var svBytes []byte
+		var err error
+		if cert != nil {
+			svBytes, err = cryptoutils.MarshalCertificateToPEM(cert)
+			if err != nil {
+				return fmt.Errorf("marshalling cert: %w", err)
+			}
+		} else {
+			svBytes, err = sigs.PublicKeyPem(co.SigVerifier, signatureoptions.WithContext(ctx))
+			if err != nil {
+				return fmt.Errorf("marshalling pubkey: %w", err)
+			}
+		}
+		bundle, err := verifyRekorBundle(ctx, bundlePath, co.RekorClient, blobBytes, sig, svBytes)
 		if err != nil {
 			// Return when the provided bundle fails verification. (Do not fallback).
 			return err
@@ -409,7 +430,8 @@ func payloadBytes(blobRef string) ([]byte, error) {
 
 // TODO: RekorClient can be removed when SIGSTORE_TRUST_REKOR_API_PUBLIC_KEY
 // is removed.
-func verifyRekorBundle(ctx context.Context, bundlePath string, rekorClient *client.Rekor) (*bundle.RekorPayload, error) {
+func verifyRekorBundle(ctx context.Context, bundlePath string, rekorClient *client.Rekor,
+	blobBytes []byte, sig string, pubKeyBytes []byte) (*bundle.RekorPayload, error) {
 	b, err := cosign.FetchLocalSignedPayloadFromPath(bundlePath)
 	if err != nil {
 		return nil, err
@@ -417,6 +439,11 @@ func verifyRekorBundle(ctx context.Context, bundlePath string, rekorClient *clie
 	if b.Bundle == nil {
 		return nil, fmt.Errorf("rekor entry is not available")
 	}
+
+	if err := verifyBundleMatchesData(ctx, b.Bundle, blobBytes, pubKeyBytes, []byte(sig)); err != nil {
+		return nil, err
+	}
+
 	publicKeys, err := cosign.GetRekorPubs(ctx, rekorClient)
 	if err != nil {
 		return nil, fmt.Errorf("retrieving rekor public key: %w", err)
@@ -437,30 +464,135 @@ func verifyRekorBundle(ctx context.Context, bundlePath string, rekorClient *clie
 	return &b.Bundle.Payload, nil
 }
 
-func extractCerts(e *models.LogEntryAnon) ([]*x509.Certificate, error) {
-	b, err := base64.StdEncoding.DecodeString(e.Body.(string))
+func verifyBundleMatchesData(ctx context.Context, bundle *bundle.RekorBundle, blobBytes, certBytes, sigBytes []byte) error {
+	eimpl, kind, apiVersion, err := unmarshalEntryImpl(bundle.Payload.Body.(string))
+	if err != nil {
+		return err
+	}
+
+	targetImpl, err := reconstructCanonicalizedEntry(ctx, kind, apiVersion, blobBytes, certBytes, sigBytes)
+	if err != nil {
+		return fmt.Errorf("recontructing rekorEntry for bundle comparison: %w", err)
+	}
+
+	switch e := eimpl.(type) {
+	case *rekord_v001.V001Entry:
+		t := targetImpl.(*rekord_v001.V001Entry)
+		data, err := e.RekordObj.Data.Content.MarshalText()
+		if err != nil {
+			return fmt.Errorf("invalid rekord data: %w", err)
+		}
+		tData, err := t.RekordObj.Data.Content.MarshalText()
+		if err != nil {
+			return fmt.Errorf("invalid rekord data: %w", err)
+		}
+		if !bytes.Equal(data, tData) {
+			return fmt.Errorf("rekord data does not match blob")
+		}
+		if e.RekordObj.Signature.Content.String() != t.RekordObj.Signature.Content.String() {
+			return fmt.Errorf("rekord signature does not match bundle")
+		}
+		if !bytes.Equal([]byte(*e.RekordObj.Signature.PublicKey.Content), []byte(*t.RekordObj.Signature.PublicKey.Content)) {
+			return fmt.Errorf("rekord public key does not match bundle")
+		}
+	case *hashedrekord_v001.V001Entry:
+		t := targetImpl.(*hashedrekord_v001.V001Entry)
+		if *e.HashedRekordObj.Data.Hash.Value != *t.HashedRekordObj.Data.Hash.Value {
+			return fmt.Errorf("hashedRekord data does not match blob")
+		}
+		if e.HashedRekordObj.Signature.Content.String() != t.HashedRekordObj.Signature.Content.String() {
+			return fmt.Errorf("hashedRekord signature does not match bundle")
+		}
+		if !bytes.Equal([]byte(e.HashedRekordObj.Signature.PublicKey.Content), t.HashedRekordObj.Signature.PublicKey.Content) {
+			return fmt.Errorf("hashedRekord public key does not match bundle")
+		}
+	case *intoto_v001.V001Entry:
+		t := targetImpl.(*intoto_v001.V001Entry)
+		if *e.IntotoObj.Content.Hash.Value != *t.IntotoObj.Content.Hash.Value {
+			return fmt.Errorf("intoto content hash does not match attestation")
+		}
+		if *e.IntotoObj.Content.PayloadHash.Value != *t.IntotoObj.Content.PayloadHash.Value {
+			return fmt.Errorf("intoto payload hash does not match attestation")
+		}
+		if !bytes.Equal([]byte(*e.IntotoObj.PublicKey), []byte(*t.IntotoObj.PublicKey)) {
+			return fmt.Errorf("intoto public key does not match bundle")
+		}
+	default:
+		return errors.New("unexpected tlog entry type")
+	}
+	return nil
+}
+
+func reconstructCanonicalizedEntry(ctx context.Context, kind, apiVersion string, blobBytes, certBytes, sigBytes []byte) (types.EntryImpl, error) {
+	props := types.ArtifactProperties{
+		PublicKeyBytes: certBytes,
+		PKIFormat:      string(pki.X509),
+	}
+	switch kind {
+	case rekord.KIND:
+		props.ArtifactBytes = blobBytes
+		props.SignatureBytes = sigBytes
+	case hashedrekord.KIND:
+		blobHash := sha256.Sum256(blobBytes)
+		props.ArtifactHash = strings.ToLower(hex.EncodeToString(blobHash[:]))
+		props.SignatureBytes = sigBytes
+	case intoto.KIND:
+		props.ArtifactBytes = blobBytes
+	default:
+		return nil, fmt.Errorf("unexpected entry kind: %s", kind)
+	}
+	proposedEntry, err := types.NewProposedEntry(ctx, kind, apiVersion, props)
 	if err != nil {
 		return nil, err
+	}
+	entry, err := types.NewEntry(proposedEntry)
+	if err != nil {
+		return nil, err
+	}
+	can, err := entry.Canonicalize(ctx)
+	if err != nil {
+		return nil, err
+	}
+	proposedEntryCan, err := models.UnmarshalProposedEntry(bytes.NewReader(can), runtime.JSONConsumer())
+	if err != nil {
+		return nil, err
+	}
+	return types.NewEntry(proposedEntryCan)
+}
+
+// unmarshalEntryImpl decodes the base64-encoded entry to a specific entry type (types.EntryImpl).
+func unmarshalEntryImpl(e string) (types.EntryImpl, string, string, error) {
+	b, err := base64.StdEncoding.DecodeString(e)
+	if err != nil {
+		return nil, "", "", err
 	}
 
 	pe, err := models.UnmarshalProposedEntry(bytes.NewReader(b), runtime.JSONConsumer())
 	if err != nil {
-		return nil, err
+		return nil, "", "", err
 	}
 
-	eimpl, err := types.NewEntry(pe)
+	entry, err := types.NewEntry(pe)
+	if err != nil {
+		return nil, "", "", err
+	}
+	return entry, pe.Kind(), entry.APIVersion(), nil
+}
+
+func extractCerts(e *models.LogEntryAnon) ([]*x509.Certificate, error) {
+	eimpl, _, _, err := unmarshalEntryImpl(e.Body.(string))
 	if err != nil {
 		return nil, err
 	}
 
 	var publicKeyB64 []byte
 	switch e := eimpl.(type) {
-	case *rekord.V001Entry:
+	case *rekord_v001.V001Entry:
 		publicKeyB64, err = e.RekordObj.Signature.PublicKey.Content.MarshalText()
 		if err != nil {
 			return nil, err
 		}
-	case *hashedrekord.V001Entry:
+	case *hashedrekord_v001.V001Entry:
 		publicKeyB64, err = e.HashedRekordObj.Signature.PublicKey.Content.MarshalText()
 		if err != nil {
 			return nil, err
