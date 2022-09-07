@@ -20,7 +20,6 @@ import (
 	"context"
 	"crypto"
 	"crypto/sha256"
-	_ "crypto/sha256" // for `crypto.SHA256`
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
@@ -99,7 +98,7 @@ func VerifyBlobCmd(ctx context.Context, ko options.KeyOpts, certRef, certEmail,
 		EnforceSCT:                   enforceSCT,
 	}
 	if options.EnableExperimental() {
-		if ko.RekorURL != "" && options.EnableExperimental() {
+		if ko.RekorURL != "" {
 			rekorClient, err := rekor.NewClient(ko.RekorURL)
 			if err != nil {
 				return fmt.Errorf("creating Rekor client: %w", err)
@@ -252,7 +251,7 @@ We recommend requesting the certificate/signature from the original signer of th
         a. Verifies the Rekor entry in the bundle, if provided. OR
         b. If we don't have a Rekor entry retrieved via cert, do an online lookup (assuming
            we are in experimental mode).
-        c. Uses the provided Rekor entry (may have been retrieved through Redis search) OR
+        c. Uses the provided Rekor entry (may have been retrieved through Rekor SearchIndex) OR
    3. If a certificate is provided, check it's expiration.
 */
 // TODO: Make a version of this public. This could be VerifyBlobCmd, but we need to
@@ -270,18 +269,21 @@ func verifyBlob(ctx context.Context, co *cosign.CheckOpts,
 	}
 
 	// Use the DSSE verifier if the payload is a DSSE with the In-Toto format.
+	// TODO: This verifier only supports verification of a single signer/signature on
+	// the envelope. Either have the verifier validate that only one signature exists,
+	// or use a multi-signature verifier.
 	if isIntotoDSSE(blobBytes) {
 		co.SigVerifier = dsse.WrapVerifier(co.SigVerifier)
 	}
 
 	// 1. Verify the signature.
-	if err := co.SigVerifier.VerifySignature(bytes.NewReader([]byte(sig)), bytes.NewReader(blobBytes)); err != nil {
+	if err := co.SigVerifier.VerifySignature(strings.NewReader(sig), bytes.NewReader(blobBytes)); err != nil {
 		return err
 	}
 
 	// This is the signature creation time. Without a transparency log entry timestamp,
 	// we can only use the current time as a bound.
-	validityTime := time.Now()
+	var validityTime time.Time
 	// 2. Checks for transparency log entry presence:
 	switch {
 	// a. We have a local bundle.
@@ -341,6 +343,11 @@ func verifyBlob(ctx context.Context, co *cosign.CheckOpts,
 
 		validityTime = time.Unix(*e.IntegratedTime, 0)
 		fmt.Fprintf(os.Stderr, "tlog entry verified with uuid: %s index: %d\n", hex.EncodeToString(uuid), *e.LogIndex)
+	// If we do not have access to a bundle, a Rekor entry, or the access to lookup,
+	// then we can only use the current time as the signature creation time to verify
+	// the signature was created when the certificate was valid.
+	default:
+		validityTime = time.Now()
 	}
 
 	// 3. If a certificate is provided, check it's expiration.
@@ -372,11 +379,7 @@ func tlogFindCertificate(ctx context.Context, rekorClient *client.Rekor,
 func tlogFindEntry(ctx context.Context, client *client.Rekor,
 	blobBytes []byte, sig string, pem []byte) (*models.LogEntryAnon, error) {
 	b64sig := base64.StdEncoding.EncodeToString([]byte(sig))
-	e, err := cosign.FindTlogEntry(ctx, client, b64sig, blobBytes, pem)
-	if err != nil {
-		return nil, err
-	}
-	return e, nil
+	return cosign.FindTlogEntry(ctx, client, b64sig, blobBytes, pem)
 }
 
 // signatures returns the raw signature
@@ -438,7 +441,7 @@ func verifyRekorBundle(ctx context.Context, bundlePath string, rekorClient *clie
 		return nil, err
 	}
 	if b.Bundle == nil {
-		return nil, fmt.Errorf("rekor entry is not available")
+		return nil, fmt.Errorf("rekor entry could not be extracted from local bundle")
 	}
 
 	if err := verifyBundleMatchesData(ctx, b.Bundle, blobBytes, pubKeyBytes, []byte(sig)); err != nil {
@@ -490,10 +493,12 @@ func verifyBundleMatchesData(ctx context.Context, bundle *bundle.RekorBundle, bl
 		if !bytes.Equal(data, tData) {
 			return fmt.Errorf("rekord data does not match blob")
 		}
-		if e.RekordObj.Signature.Content.String() != t.RekordObj.Signature.Content.String() {
-			return fmt.Errorf("rekord signature does not match bundle")
+		if err := compareBase64Strings(e.RekordObj.Signature.Content.String(),
+			t.RekordObj.Signature.Content.String()); err != nil {
+			return fmt.Errorf("rekord signature does not match bundle %s", err)
 		}
-		if !bytes.Equal([]byte(*e.RekordObj.Signature.PublicKey.Content), []byte(*t.RekordObj.Signature.PublicKey.Content)) {
+		if err := compareBase64Strings(e.RekordObj.Signature.PublicKey.Content.String(),
+			t.RekordObj.Signature.PublicKey.Content.String()); err != nil {
 			return fmt.Errorf("rekord public key does not match bundle")
 		}
 	case *hashedrekord_v001.V001Entry:
@@ -501,10 +506,12 @@ func verifyBundleMatchesData(ctx context.Context, bundle *bundle.RekorBundle, bl
 		if *e.HashedRekordObj.Data.Hash.Value != *t.HashedRekordObj.Data.Hash.Value {
 			return fmt.Errorf("hashedRekord data does not match blob")
 		}
-		if e.HashedRekordObj.Signature.Content.String() != t.HashedRekordObj.Signature.Content.String() {
-			return fmt.Errorf("hashedRekord signature does not match bundle")
+		if err := compareBase64Strings(e.HashedRekordObj.Signature.Content.String(),
+			t.HashedRekordObj.Signature.Content.String()); err != nil {
+			return fmt.Errorf("hashedRekord signature does not match bundle %s", err)
 		}
-		if !bytes.Equal([]byte(e.HashedRekordObj.Signature.PublicKey.Content), t.HashedRekordObj.Signature.PublicKey.Content) {
+		if err := compareBase64Strings(e.HashedRekordObj.Signature.PublicKey.Content.String(),
+			t.HashedRekordObj.Signature.PublicKey.Content.String()); err != nil {
 			return fmt.Errorf("hashedRekord public key does not match bundle")
 		}
 	case *intoto_v001.V001Entry:
@@ -515,7 +522,8 @@ func verifyBundleMatchesData(ctx context.Context, bundle *bundle.RekorBundle, bl
 		if *e.IntotoObj.Content.PayloadHash.Value != *t.IntotoObj.Content.PayloadHash.Value {
 			return fmt.Errorf("intoto payload hash does not match attestation")
 		}
-		if !bytes.Equal([]byte(*e.IntotoObj.PublicKey), []byte(*t.IntotoObj.PublicKey)) {
+		if err := compareBase64Strings(e.IntotoObj.PublicKey.String(),
+			t.IntotoObj.PublicKey.String()); err != nil {
 			return fmt.Errorf("intoto public key does not match bundle")
 		}
 	default:
@@ -630,4 +638,20 @@ func isIntotoDSSE(blobBytes []byte) bool {
 	}
 
 	return true
+}
+
+// TODO: Use this function to compare bundle signatures in OCI.
+func compareBase64Strings(got string, expected string) error {
+	decodeFirst, err := base64.StdEncoding.DecodeString(got)
+	if err != nil {
+		return fmt.Errorf("decoding base64 string %s", got)
+	}
+	decodeSecond, err := base64.StdEncoding.DecodeString(expected)
+	if err != nil {
+		return fmt.Errorf("decoding base64 string %s", expected)
+	}
+	if !bytes.Equal(decodeFirst, decodeSecond) {
+		return fmt.Errorf("comparing base64 strings, expected %s, got %s", expected, got)
+	}
+	return nil
 }
