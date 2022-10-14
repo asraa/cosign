@@ -892,7 +892,7 @@ func TestVerifyBlobCmdWithBundle(t *testing.T) {
 			"", "", "", "", "",
 			// GitHub identity flags end
 			false /*enforceSCT*/)
-		if err == nil || !strings.Contains(err.Error(), "unable to verify SET") {
+		if err == nil || !strings.Contains(err.Error(), "verifying SET") {
 			t.Fatalf("expected error verifying SET, got %v", err)
 		}
 	})

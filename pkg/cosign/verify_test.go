@@ -406,14 +406,11 @@ func TestVerifyImageSignatureWithSigVerifierAndRekor(t *testing.T) {
 	if _, err := VerifyImageSignature(context.TODO(), ociSig, v1.Hash{}, &CheckOpts{
 		SigVerifier: sv,
 		RekorClient: mClient,
-	}); err == nil || !strings.Contains(err.Error(), "verifying inclusion proof") {
-		// TODO(wlynch): This is a weak test, since this is really failing because
-		// there is no inclusion proof for the Rekor entry rather than failing to
-		// validate the Rekor public key itself. At the very least this ensures
-		// that we're hitting tlog validation during signature checking,
-		// but we should look into improving this once there is an in-memory
-		// Rekor client that is capable of performing inclusion proof validation
-		// in unit tests.
+	}); err == nil || !strings.Contains(err.Error(), "rekor log public key not found for payload") {
+		// This is failing due to validating the Rekor public key itself, checking that
+		// cosign does require a matching trustd public key to check the validity of the
+		// entry. Even better, this test should expect a matching public key (spoofed),
+		// and the incorrect signature.
 		t.Fatalf("expected error while verifying signature, got %s", err)
 	}
 }

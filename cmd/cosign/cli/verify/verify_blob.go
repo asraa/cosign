@@ -42,6 +42,7 @@ import (
 	"github.com/sigstore/cosign/pkg/cosign/pivkey"
 	"github.com/sigstore/cosign/pkg/cosign/pkcs11key"
 	sigs "github.com/sigstore/cosign/pkg/signature"
+	"github.com/sigstore/sigstore/pkg/signature"
 	"github.com/sigstore/sigstore/pkg/tuf"
 
 	ctypes "github.com/sigstore/cosign/pkg/types"
@@ -55,6 +56,7 @@ import (
 	intoto_v001 "github.com/sigstore/rekor/pkg/types/intoto/v0.0.1"
 	"github.com/sigstore/rekor/pkg/types/rekord"
 	rekord_v001 "github.com/sigstore/rekor/pkg/types/rekord/v0.0.1"
+	"github.com/sigstore/rekor/pkg/verify"
 	"github.com/sigstore/sigstore/pkg/cryptoutils"
 	"github.com/sigstore/sigstore/pkg/signature/dsse"
 	signatureoptions "github.com/sigstore/sigstore/pkg/signature/options"
@@ -499,10 +501,25 @@ func verifyRekorBundle(ctx context.Context, bundle *bundle.RekorBundle, rekorCli
 	if !ok {
 		return nil, errors.New("rekor log public key not found for payload")
 	}
-	err = cosign.VerifySET(bundle.Payload, bundle.SignedEntryTimestamp, pubKey.PubKey)
+	verifier, err := signature.LoadVerifier(pubKey.PubKey, crypto.SHA256)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("loading rekor verifier: %w", err)
 	}
+
+	e := &models.LogEntryAnon{
+		Body:           bundle.Payload.Body,
+		LogID:          &bundle.Payload.LogID,
+		LogIndex:       &bundle.Payload.LogIndex,
+		IntegratedTime: &bundle.Payload.IntegratedTime,
+		Verification: &models.LogEntryAnonVerification{
+			SignedEntryTimestamp: bundle.SignedEntryTimestamp,
+		},
+	}
+
+	if err := verify.VerifySignedEntryTimestamp(ctx, e, verifier); err != nil {
+		return nil, fmt.Errorf("verifying SET: %w", err)
+	}
+
 	if pubKey.Status != tuf.Active {
 		fmt.Fprintf(os.Stderr, "**Info** Successfully verified Rekor entry using an expired verification key\n")
 	}

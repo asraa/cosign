@@ -31,10 +31,8 @@ import (
 
 	"github.com/go-openapi/strfmt"
 	"github.com/go-openapi/swag"
-	"github.com/transparency-dev/merkle/proof"
 	"github.com/transparency-dev/merkle/rfc6962"
 
-	"github.com/sigstore/cosign/pkg/cosign/bundle"
 	"github.com/sigstore/rekor/pkg/generated/client"
 	"github.com/sigstore/rekor/pkg/generated/client/entries"
 	"github.com/sigstore/rekor/pkg/generated/client/index"
@@ -43,6 +41,8 @@ import (
 	hashedrekord_v001 "github.com/sigstore/rekor/pkg/types/hashedrekord/v0.0.1"
 	"github.com/sigstore/rekor/pkg/types/intoto"
 	intoto_v001 "github.com/sigstore/rekor/pkg/types/intoto/v0.0.1"
+	"github.com/sigstore/rekor/pkg/verify"
+	"github.com/sigstore/sigstore/pkg/signature"
 	"github.com/sigstore/sigstore/pkg/tuf"
 )
 
@@ -439,52 +439,29 @@ func FindTLogEntriesByPayload(ctx context.Context, rekorClient *client.Rekor, pa
 	return searchIndex.GetPayload(), nil
 }
 
-// VerityTLogEntry verifies a TLog entry.
+// VerityTLogEntry verifies a TLog entry by verifying its inclusion proof using
+// the body's leaf hash up to a verified root hash and SignedEntryTimestamp
+// verification.
 func VerifyTLogEntry(ctx context.Context, rekorClient *client.Rekor, e *models.LogEntryAnon) error {
-	if e.Verification == nil || e.Verification.InclusionProof == nil {
-		return errors.New("inclusion proof not provided")
-	}
-
-	hashes := [][]byte{}
-	for _, h := range e.Verification.InclusionProof.Hashes {
-		hb, _ := hex.DecodeString(h)
-		hashes = append(hashes, hb)
-	}
-
-	rootHash, _ := hex.DecodeString(*e.Verification.InclusionProof.RootHash)
-	entryBytes, err := base64.StdEncoding.DecodeString(e.Body.(string))
-	if err != nil {
-		return err
-	}
-	leafHash := rfc6962.DefaultHasher.HashLeaf(entryBytes)
-
-	// Verify the inclusion proof.
-	if err := proof.VerifyInclusion(rfc6962.DefaultHasher, uint64(*e.Verification.InclusionProof.LogIndex), uint64(*e.Verification.InclusionProof.TreeSize),
-		leafHash, hashes, rootHash); err != nil {
-		return fmt.Errorf("verifying inclusion proof: %w", err)
-	}
-
-	// Verify rekor's signature over the SET.
-	payload := bundle.RekorPayload{
-		Body:           e.Body,
-		IntegratedTime: *e.IntegratedTime,
-		LogIndex:       *e.LogIndex,
-		LogID:          *e.LogID,
-	}
-
 	rekorPubKeys, err := GetRekorPubs(ctx, rekorClient)
 	if err != nil {
 		return fmt.Errorf("unable to fetch Rekor public keys: %w", err)
 	}
 
-	pubKey, ok := rekorPubKeys[payload.LogID]
+	pubKey, ok := rekorPubKeys[*e.LogID]
 	if !ok {
 		return errors.New("rekor log public key not found for payload")
 	}
-	err = VerifySET(payload, []byte(e.Verification.SignedEntryTimestamp), pubKey.PubKey)
+
+	verifier, err := signature.LoadVerifier(pubKey.PubKey, crypto.SHA256)
 	if err != nil {
-		return fmt.Errorf("verifying signedEntryTimestamp: %w", err)
+		return fmt.Errorf("loading rekor verifier: %w", err)
 	}
+
+	if err := verify.VerifyLogEntry(ctx, e, verifier); err != nil {
+		return fmt.Errorf("verifying Rekor entry: %w", err)
+	}
+
 	if pubKey.Status != tuf.Active {
 		fmt.Fprintf(os.Stderr, "**Info** Successfully verified Rekor entry using an expired verification key\n")
 	}

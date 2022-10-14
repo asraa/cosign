@@ -18,7 +18,6 @@ import (
 	"bytes"
 	"context"
 	"crypto"
-	"crypto/ecdsa"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/asn1"
@@ -33,14 +32,12 @@ import (
 	"time"
 
 	"github.com/sigstore/cosign/cmd/cosign/cli/fulcio/fulcioverifier/ctl"
-	cbundle "github.com/sigstore/cosign/pkg/cosign/bundle"
 	"github.com/sigstore/sigstore/pkg/tuf"
 
 	"github.com/sigstore/cosign/pkg/blob"
 	"github.com/sigstore/cosign/pkg/oci/static"
 	"github.com/sigstore/cosign/pkg/types"
 
-	"github.com/cyberphone/json-canonicalization/go/src/webpki.org/jsoncanonicalizer"
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 
@@ -50,6 +47,7 @@ import (
 	ociremote "github.com/sigstore/cosign/pkg/oci/remote"
 	"github.com/sigstore/rekor/pkg/generated/client"
 	"github.com/sigstore/rekor/pkg/generated/models"
+	"github.com/sigstore/rekor/pkg/verify"
 	"github.com/sigstore/sigstore/pkg/cryptoutils"
 	"github.com/sigstore/sigstore/pkg/signature"
 	"github.com/sigstore/sigstore/pkg/signature/dsse"
@@ -894,10 +892,23 @@ func VerifyBundle(ctx context.Context, sig oci.Signature, rekorClient *client.Re
 	if !ok {
 		return false, &VerificationError{"rekor log public key not found for payload"}
 	}
-	err = VerifySET(bundle.Payload, bundle.SignedEntryTimestamp, pubKey.PubKey)
+
+	verifier, err := signature.LoadVerifier(pubKey.PubKey, crypto.SHA256)
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("loading rekor verifier: %w", err)
 	}
+
+	e := &models.LogEntryAnon{
+		Body:           bundle.Payload.Body,
+		LogID:          &bundle.Payload.LogID,
+		LogIndex:       &bundle.Payload.LogIndex,
+		IntegratedTime: &bundle.Payload.IntegratedTime,
+	}
+
+	if err := verify.VerifySignedEntryTimestamp(ctx, e, verifier); err != nil {
+		return false, &VerificationError{err.Error()}
+	}
+
 	if pubKey.Status != tuf.Active {
 		fmt.Fprintf(os.Stderr, "**Info** Successfully verified Rekor entry using an expired verification key\n")
 	}
@@ -1056,24 +1067,6 @@ func bundleSig(bundleBody string) (string, error) {
 		return "", err
 	}
 	return hrekordObj.Signature.Content.String(), nil
-}
-
-func VerifySET(bundlePayload cbundle.RekorPayload, signature []byte, pub *ecdsa.PublicKey) error {
-	contents, err := json.Marshal(bundlePayload)
-	if err != nil {
-		return fmt.Errorf("marshaling: %w", err)
-	}
-	canonicalized, err := jsoncanonicalizer.Transform(contents)
-	if err != nil {
-		return fmt.Errorf("canonicalizing: %w", err)
-	}
-
-	// verify the SET against the public key
-	hash := sha256.Sum256(canonicalized)
-	if !ecdsa.VerifyASN1(pub, hash[:], signature) {
-		return &VerificationError{"unable to verify SET"}
-	}
-	return nil
 }
 
 func TrustedCert(cert *x509.Certificate, roots *x509.CertPool, intermediates *x509.CertPool) ([][]*x509.Certificate, error) {
